@@ -1,0 +1,300 @@
+WALLET & P2P TRANSFER SERVICE — BASELINE DESIGN
+
+1. REQUIREMENT
+
+APIs:
+- POST /wallets
+- GET /wallets/{id}
+- POST /transfers
+- GET /transfers/{id}
+
+Correctness:
+- Conservation: total wallet balance remains unchanged.
+- No overdraft: balance can never become negative.
+- Idempotency:
+  - Same key + same body -> return original result.
+  - Same key + different body -> 409 Conflict.
+  - Concurrent same-key requests -> only one debit/credit.
+- Concurrent wallet creation for same user -> exactly one wallet.
+- Money stored as integer paise using BIGINT, never float.
+
+2. Architecture:
+Client -> Load Balancer -> Stateless Go APIs -> PostgreSQL Primary
+                                             -> Read Replicas
+
+PostgreSQL is the source of truth.
+Money writes/current balance prioritize consistency over availability.
+
+3. SQL VS NOSQL
+
+Choice: PostgreSQL initially.
+
+Why SQL:
+- ACID transaction for debit + credit.
+- Atomic conditional UPDATE for concurrency/no overdraft.
+- Strong consistency is important for money.
+
+Why not NoSQL initially:
+- Money movement needs atomic multi-row consistency.
+- NoSQL would require additional distributed consistency mechanisms.
+
+Read replicas:
+- Useful for historical/non-critical read-heavy workloads.
+- Current wallet balance should preferably come from primary because replicas can lag.
+
+Multiple masters/sharding:
+- Not initially used.
+- Cross-shard A -> B transfers make atomicity much harder.
+- Introduce only when scale actually requires it.
+
+Historical data:
+- Old transfers can eventually be archived to cheaper storage.
+
+
+4. DATA MODEL
+
+wallets:
+- id UUID PRIMARY KEY
+- user_id VARCHAR NOT NULL UNIQUE
+- balance_paise BIGINT NOT NULL DEFAULT 0
+- status
+- created_at
+- updated_at
+
+transfers:
+- id UUID PRIMARY KEY
+- from_wallet_id UUID NOT NULL
+- to_wallet_id UUID NOT NULL
+- amount_paise BIGINT NOT NULL
+- idempotency_key VARCHAR NOT NULL UNIQUE
+- request_hash VARCHAR(64) NOT NULL
+- status VARCHAR NOT NULL
+- created_at
+- updated_at
+
+Constraints:
+- UNIQUE(user_id)
+- UNIQUE(idempotency_key)
+- amount_paise > 0
+- sender != receiver
+
+
+5. API REQUEST / RESPONSE
+
+POST /wallets
+
+Request:
+{
+  "user_id": "user-123"
+}
+
+Response:
+{
+  "wallet_id": "uuid",
+  "user_id": "user-123",
+  "balance_paise": 0
+}
+
+
+GET /wallets/{id}
+
+Response:
+{
+  "wallet_id": "uuid",
+  "user_id": "user-123",
+  "balance_paise": 10000
+}
+
+
+POST /transfers
+
+Request:
+{
+  "from": "wallet-A",
+  "to": "wallet-B",
+  "amount_paise": 5000,
+  "idempotency_key": "abc-123"
+}
+
+Success:
+{
+  "transfer_id": "uuid",
+  "status": "COMPLETED"
+}
+
+Insufficient funds:
+{
+  "transfer_id": "uuid",
+  "status": "DECLINED",
+  "reason": "INSUFFICIENT_FUNDS"
+}
+
+Same key + different body:
+HTTP 409 Conflict
+
+
+GET /transfers/{id}
+
+Response:
+{
+  "transfer_id": "uuid",
+  "from": "wallet-A",
+  "to": "wallet-B",
+  "amount_paise": 5000,
+  "status": "COMPLETED"
+}
+
+
+6. WORKFLOW + DB QUERIES
+
+A. POST /wallets
+
+1. Authenticate user -> get user_id.
+
+2. Insert:
+INSERT INTO wallets(id, user_id, balance_paise, status)
+VALUES (?, ?, 0, 'ACTIVE')
+ON CONFLICT (user_id) DO NOTHING;
+
+3. Fetch:
+SELECT id, user_id, balance_paise, status
+FROM wallets
+WHERE user_id = ?;
+
+4. Return wallet.
+
+Why:
+UNIQUE(user_id) + ON CONFLICT makes concurrent creation race-free.
+
+
+B. GET /wallets/{id}
+
+1. Authenticate/authorize user.
+
+2. Query primary:
+SELECT id, user_id, balance_paise, status
+FROM wallets
+WHERE id = ?;
+
+3. Return wallet.
+
+Why:
+Primary gives the latest committed balance; replicas may lag.
+
+
+C. POST /transfers
+
+BEGIN;
+
+1. Validate request.
+
+2. Calculate request_hash(from, to, amount).
+
+3. Check idempotency:
+SELECT id, from_wallet_id, to_wallet_id,
+       amount_paise, request_hash, status
+FROM transfers
+WHERE idempotency_key = ?;
+
+4. If existing:
+   - Same hash -> return original result.
+   - Different hash -> 409 Conflict.
+
+5. Atomic debit:
+UPDATE wallets
+SET balance_paise = balance_paise - ?
+WHERE id = ?
+  AND balance_paise >= ?;
+
+6. If affected rows = 0:
+   - Record DECLINED transfer.
+   - COMMIT.
+   - Return insufficient funds.
+
+7. Credit receiver:
+UPDATE wallets
+SET balance_paise = balance_paise + ?
+WHERE id = ?;
+
+8. Insert transfer:
+INSERT INTO transfers(
+    id, from_wallet_id, to_wallet_id,
+    amount_paise, idempotency_key,
+    request_hash, status
+)
+VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED');
+
+9. COMMIT.
+
+Why:
+- Conditional UPDATE prevents overdraft.
+- PostgreSQL serializes concurrent updates to the same wallet row.
+- Debit + credit + idempotency are in one transaction.
+- Failure before COMMIT -> entire transaction rolls back.
+
+
+D. GET /transfers/{id}
+
+1. Query:
+SELECT id, from_wallet_id, to_wallet_id,
+       amount_paise, status
+FROM transfers
+WHERE id = ?;
+
+2. Return transfer.
+
+Can use replica if eventual consistency is acceptable;
+primary gives strongest read-after-write consistency.
+
+
+CORE DESIGN
+
+UNIQUE(user_id)
+-> Race-free wallet creation
+
+UNIQUE(idempotency_key)
+-> Exactly-once request identity
+
+Atomic conditional UPDATE
+-> No overdraft + safe concurrent balance updates
+
+Single DB transaction
+-> Debit + credit + idempotency are atomic
+
+PostgreSQL
+-> Source of truth for money
+
+No Redis locks / application locks / distributed transactions
+are required in the baseline design.
+
+
+
+10. DATABASE SCALING DECISION
+
+    At the expected scale of ~100M transfers/day:
+
+    Average TPS:
+    100M / 86,400 ≈ 1,157 TPS
+
+    Assumed peak:
+    ~10,000 TPS
+
+    PostgreSQL is still a suitable choice because the workload is simple:
+    - Small rows
+    - Integer BIGINT money values
+    - Indexed point lookups
+    - Simple INSERT/UPDATE operations
+    - No complex joins in the critical transfer path
+
+    A properly provisioned PostgreSQL primary can potentially handle ~10K TPS for this
+    workload, but this must be validated through load testing because each transfer
+    generates multiple DB writes and WAL activity.
+
+    A single transfer approximately performs:
+    - Idempotency check/insert
+    - Conditional UPDATE on sender wallet
+    - UPDATE on receiver wallet
+    - INSERT into transfers
+
+    Therefore, 10K transfers/sec can result in roughly 30K+ row modifications/sec,
+    in addition to WAL, indexes, transaction commits, and other database overhead.
